@@ -1,0 +1,256 @@
+// Model Classes
+package com.inventory.models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Data
+@Entity
+@Table(name = "users")
+public class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(unique = true, nullable = false)
+    private String username;
+    
+    @Column(nullable = false)
+    private String password;
+    
+    @Column(nullable = false)
+    private String role;
+}
+
+@Data
+@Entity
+@Table(name = "products")
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false)
+    private String name;
+    
+    private String description;
+    
+    @Column(nullable = false)
+    private Integer quantity;
+    
+    @Column(nullable = false)
+    private Double price;
+}
+
+@Data
+@Entity
+@Table(name = "sales")
+public class Sale {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @ManyToOne
+    @JoinColumn(name = "product_id", nullable = false)
+    private Product product;
+    
+    @Column(nullable = false)
+    private Integer quantity;
+    
+    private LocalDateTime saleDate = LocalDateTime.now();
+}
+
+@Data
+@Entity
+@Table(name = "purchases")
+public class Purchase {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @ManyToOne
+    @JoinColumn(name = "product_id", nullable = false)
+    private Product product;
+    
+    @Column(nullable = false)
+    private Integer quantity;
+    
+    private LocalDateTime purchaseDate = LocalDateTime.now();
+}
+
+@Data
+@Entity
+@Table(name = "shipments")
+public class Shipment {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @OneToOne
+    @JoinColumn(name = "purchase_id", nullable = false)
+    private Purchase purchase;
+    
+    @Column(nullable = false)
+    private String status;
+    
+    private LocalDateTime shipmentDate;
+}
+
+// Repositories
+package com.inventory.repositories;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByUsername(String username);
+}
+
+public interface ProductRepository extends JpaRepository<Product, Long> {
+    List<Product> findByNameContainingIgnoreCase(String query);
+}
+
+public interface SaleRepository extends JpaRepository<Sale, Long> {}
+public interface PurchaseRepository extends JpaRepository<Purchase, Long> {}
+public interface ShipmentRepository extends JpaRepository<Shipment, Long> {}
+
+// Services
+package com.inventory.services;
+
+import org.springframework.stereotype.Service;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import lombok.RequiredArgsConstructor;
+import jakarta.transaction.Transactional;
+
+@Service
+@RequiredArgsConstructor
+public class AuthService {
+    private final UserRepository userRepository;
+    private final BCryptPasswordEncoder passwordEncoder;
+    
+    public Optional<User> login(String username, String password) {
+        return userRepository.findByUsername(username)
+            .filter(user -> passwordEncoder.matches(password, user.getPassword()));
+    }
+}
+
+@Service
+@RequiredArgsConstructor
+public class InventoryService {
+    private final ProductRepository productRepository;
+    
+    @Transactional
+    public boolean manageInventory(Long productId, Integer quantityChange) {
+        return productRepository.findById(productId)
+            .map(product -> {
+                product.setQuantity(product.getQuantity() + quantityChange);
+                productRepository.save(product);
+                return true;
+            })
+            .orElse(false);
+    }
+    
+    public List<Product> searchProducts(String query) {
+        return productRepository.findByNameContainingIgnoreCase(query);
+    }
+    
+    public Map<String, Object> generateReport() {
+        List<Product> products = productRepository.findAll();
+        Map<String, Object> report = new HashMap<>();
+        report.put("totalProducts", products.size());
+        report.put("lowStockItems", products.stream()
+            .filter(p -> p.getQuantity() < 10)
+            .collect(Collectors.toList()));
+        report.put("totalValue", products.stream()
+            .mapToDouble(p -> p.getQuantity() * p.getPrice())
+            .sum());
+        return report;
+    }
+}
+
+@Service
+@RequiredArgsConstructor
+public class SalesService {
+    private final SaleRepository saleRepository;
+    private final ProductRepository productRepository;
+    
+    @Transactional
+    public Optional<Sale> recordSale(Long productId, Integer quantity) {
+        return productRepository.findById(productId)
+            .filter(product -> product.getQuantity() >= quantity)
+            .map(product -> {
+                product.setQuantity(product.getQuantity() - quantity);
+                Sale sale = new Sale();
+                sale.setProduct(product);
+                sale.setQuantity(quantity);
+                return saleRepository.save(sale);
+            });
+    }
+}
+
+// Controllers
+package com.inventory.controllers;
+
+import org.springframework.web.bind.annotation.*;
+import lombok.RequiredArgsConstructor;
+
+@RestController
+@RequestMapping("/api")
+@RequiredArgsConstructor
+public class InventoryController {
+    private final AuthService authService;
+    private final InventoryService inventoryService;
+    private final SalesService salesService;
+    
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestBody LoginRequest request) {
+        return authService.login(request.getUsername(), request.getPassword())
+            .map(user -> ResponseEntity.ok().body(Map.of(
+                "message", "Login successful",
+                "role", user.getRole()
+            )))
+            .orElse(ResponseEntity.status(HttpStatus.UNAUTHORIZED).build());
+    }
+    
+    @GetMapping("/inventory/search")
+    public List<Product> searchInventory(@RequestParam String query) {
+        return inventoryService.searchProducts(query);
+    }
+    
+    @PostMapping("/inventory/report")
+    public Map<String, Object> generateInventoryReport() {
+        return inventoryService.generateReport();
+    }
+    
+    @PostMapping("/sales")
+    public ResponseEntity<Sale> createSale(@RequestBody SaleRequest request) {
+        return salesService.recordSale(request.getProductId(), request.getQuantity())
+            .map(ResponseEntity::ok)
+            .orElse(ResponseEntity.badRequest().build());
+    }
+}
+
+// Configuration
+package com.inventory.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    @Bean
+    public BCryptPasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+    
+    // Security configurations...
+}
+
+// Application Entry Point
+@SpringBootApplication
+public class InventoryApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(InventoryApplication.class, args);
+    }
+}
