@@ -1,0 +1,192 @@
+# models.py
+from datetime import datetime
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
+
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True)
+    username = Column(String(50), unique=True, nullable=False)
+    password = Column(String(255), nullable=False)
+    role = Column(String(20), nullable=False)  # warehouse_manager, it_support, other
+    
+class Product(Base):
+    __tablename__ = 'products'
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500))
+    quantity = Column(Integer, default=0)
+    price = Column(Float, nullable=False)
+    
+class Sale(Base):
+    __tablename__ = 'sales'
+    
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey('products.id'))
+    quantity = Column(Integer, nullable=False)
+    sale_date = Column(DateTime, default=datetime.utcnow)
+    
+    product = relationship("Product")
+    
+class Purchase(Base):
+    __tablename__ = 'purchases'
+    
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey('products.id'))
+    quantity = Column(Integer, nullable=False)
+    purchase_date = Column(DateTime, default=datetime.utcnow)
+    
+    product = relationship("Product")
+    
+class Shipment(Base):
+    __tablename__ = 'shipments'
+    
+    id = Column(Integer, primary_key=True)
+    purchase_id = Column(Integer, ForeignKey('purchases.id'))
+    status = Column(String(20), nullable=False)  # pending, shipped, delivered
+    shipment_date = Column(DateTime)
+    
+    purchase = relationship("Purchase")
+
+# services.py
+from sqlalchemy.orm import Session
+from models import User, Product, Sale, Purchase, Shipment
+from datetime import datetime
+import bcrypt
+from typing import List, Optional
+
+class AuthService:
+    def __init__(self, db: Session):
+        self.db = db
+        
+    def login(self, username: str, password: str) -> Optional[User]:
+        user = self.db.query(User).filter(User.username == username).first()
+        if user and bcrypt.checkpw(password.encode(), user.password.encode()):
+            return user
+        return None
+
+class InventoryService:
+    def __init__(self, db: Session):
+        self.db = db
+    
+    def manage_inventory(self, product_id: int, quantity_change: int) -> bool:
+        product = self.db.query(Product).get(product_id)
+        if product:
+            product.quantity += quantity_change
+            self.db.commit()
+            return True
+        return False
+    
+    def search_products(self, query: str) -> List[Product]:
+        return self.db.query(Product).filter(
+            Product.name.ilike(f"%{query}%")
+        ).all()
+    
+    def generate_report(self) -> dict:
+        products = self.db.query(Product).all()
+        return {
+            "total_products": len(products),
+            "low_stock_items": [p for p in products if p.quantity < 10],
+            "total_value": sum(p.quantity * p.price for p in products)
+        }
+
+class UserManagementService:
+    def __init__(self, db: Session):
+        self.db = db
+    
+    def create_user(self, username: str, password: str, role: str) -> User:
+        hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+        user = User(username=username, password=hashed.decode(), role=role)
+        self.db.add(user)
+        self.db.commit()
+        return user
+
+class SalesService:
+    def __init__(self, db: Session):
+        self.db = db
+    
+    def record_sale(self, product_id: int, quantity: int) -> Optional[Sale]:
+        product = self.db.query(Product).get(product_id)
+        if product and product.quantity >= quantity:
+            sale = Sale(product_id=product_id, quantity=quantity)
+            product.quantity -= quantity
+            self.db.add(sale)
+            self.db.commit()
+            return sale
+        return None
+
+class PurchaseService:
+    def __init__(self, db: Session):
+        self.db = db
+    
+    def create_purchase(self, product_id: int, quantity: int) -> Purchase:
+        purchase = Purchase(product_id=product_id, quantity=quantity)
+        self.db.add(purchase)
+        self.db.commit()
+        return purchase
+
+class ShipmentService:
+    def __init__(self, db: Session):
+        self.db = db
+    
+    def process_shipment(self, purchase_id: int) -> Shipment:
+        shipment = Shipment(
+            purchase_id=purchase_id,
+            status="pending",
+            shipment_date=datetime.utcnow()
+        )
+        self.db.add(shipment)
+        self.db.commit()
+        return shipment
+
+# main.py
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from database import get_db
+from services import (
+    AuthService, InventoryService, UserManagementService,
+    SalesService, PurchaseService, ShipmentService
+)
+
+app = FastAPI()
+
+@app.post("/login")
+def login(username: str, password: str, db: Session = Depends(get_db)):
+    auth_service = AuthService(db)
+    user = auth_service.login(username, password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {"message": "Login successful", "role": user.role}
+
+@app.get("/inventory/search")
+def search_inventory(query: str, db: Session = Depends(get_db)):
+    inventory_service = InventoryService(db)
+    return inventory_service.search_products(query)
+
+@app.post("/inventory/report")
+def generate_inventory_report(db: Session = Depends(get_db)):
+    inventory_service = InventoryService(db)
+    return inventory_service.generate_report()
+
+@app.post("/sales")
+def create_sale(product_id: int, quantity: int, db: Session = Depends(get_db)):
+    sales_service = SalesService(db)
+    sale = sales_service.record_sale(product_id, quantity)
+    if not sale:
+        raise HTTPException(status_code=400, detail="Invalid sale request")
+    return sale
+
+@app.post("/purchases")
+def create_purchase(product_id: int, quantity: int, db: Session = Depends(get_db)):
+    purchase_service = PurchaseService(db)
+    return purchase_service.create_purchase(product_id, quantity)
+
+@app.post("/shipments/{purchase_id}")
+def process_shipment(purchase_id: int, db: Session = Depends(get_db)):
+    shipment_service = ShipmentService(db)
+    return shipment_service.process_shipment(purchase_id)
